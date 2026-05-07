@@ -3,3 +3,5 @@ master/
 __pycache__/
 *.pyc
 .DS_Store
+output/*.xlsx
+output/.~lock*
