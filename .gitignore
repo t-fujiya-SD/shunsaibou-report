@@ -1,5 +1,4 @@
 input/
-output/
 master/
 __pycache__/
 *.pyc
