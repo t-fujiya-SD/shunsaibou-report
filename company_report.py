@@ -195,7 +195,7 @@ def build_html(data, generated_at):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{company} 仕入れレポート</title>
+<title>{company}様 仕入れレポート</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
 <style>
@@ -256,7 +256,7 @@ def build_html(data, generated_at):
 </head>
 <body>
 <header>
-  <h1>{company}　仕入れレポート</h1>
+  <h1>{company}様　仕入れレポート</h1>
   <p>生成日時: {generated_at}　　旬彩坊 提供</p>
 </header>
 <div class="container">
