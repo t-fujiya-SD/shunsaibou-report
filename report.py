@@ -8,7 +8,28 @@
 import pandas as pd
 from pathlib import Path
 import json
+import urllib.request
 from datetime import datetime
+
+CDN_CHARTJS      = "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+CDN_DATALABELS   = "https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"
+CACHE_DIR        = Path(__file__).parent / ".js_cache"
+
+def fetch_js(url: str) -> str:
+    """CDN から JS を取得してキャッシュ。オフライン時はキャッシュを使用。"""
+    CACHE_DIR.mkdir(exist_ok=True)
+    fname = CACHE_DIR / url.split("/")[-1]
+    if fname.exists():
+        return fname.read_text(encoding="utf-8")
+    print(f"  JSダウンロード中: {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            js = r.read().decode("utf-8")
+        fname.write_text(js, encoding="utf-8")
+        return js
+    except Exception as e:
+        print(f"  [WARN] ダウンロード失敗 ({e})。CDN参照にフォールバックします。")
+        return None
 
 BASE_DIR     = Path(__file__).parent
 OUTPUT_DIR   = BASE_DIR / "output"
@@ -70,6 +91,12 @@ def week_to_month(week_str):
     monday = datetime.fromisocalendar(int(year), int(w), 1)
     return f"{monday.year}年{monday.month}月"
 
+def week_to_label(week_str):
+    """2026-W14 → '3月30日〜' のように週の月曜日を日本語表記に変換"""
+    year, w = week_str.split("-W")
+    monday = datetime.fromisocalendar(int(year), int(w), 1)
+    return f"{monday.month}月{monday.day}日〜"
+
 def build_weekly_data(df, store_map):
     weeks = sorted(df["集計週"].unique())
     df = df.copy()
@@ -91,6 +118,7 @@ def build_weekly_data(df, store_map):
             "by_source": by_source,
             "by_company": by_company,
             "month": week_to_month(w),
+            "label": week_to_label(w),
         }
     month_to_weeks = {}
     for w in weeks:
@@ -170,7 +198,7 @@ def build_search_data(detail_df, store_map):
 def fmt_yen(val):
     return f"¥{val:,}"
 
-def build_html(all_data, search_data, generated_at):
+def build_html(all_data, search_data, generated_at, js_chartjs=None, js_datalabels=None):
     weeks = all_data["weeks"]
     latest_total = all_data["weekly"][weeks[-1]]["total"] if weeks else 0
     cumulative = sum(v["total"] for v in all_data["weekly"].values())
@@ -178,14 +206,22 @@ def build_html(all_data, search_data, generated_at):
     data_json = json.dumps(all_data, ensure_ascii=False)
     search_json = json.dumps(search_data, ensure_ascii=False)
 
+    # JS: インライン化できた場合は埋め込み、失敗時は CDN 参照にフォールバック
+    if js_chartjs:
+        script_tags = f"<script>{js_chartjs}</script>\n<script>{js_datalabels}</script>"
+    else:
+        script_tags = (
+            '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>\n'
+            '<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>'
+        )
+
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>旬彩坊 週次売上レポート</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+{script_tags}
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: 'Hiragino Sans', 'Meiryo', sans-serif; background: #f5f6fa; color: #333; }}
@@ -260,7 +296,7 @@ def build_html(all_data, search_data, generated_at):
   <div class="summary-grid">
     <div class="summary-card">
       <div class="label">最新週</div>
-      <div class="value">{weeks[-1] if weeks else '-'}</div>
+      <div class="value">{week_to_label(weeks[-1]) if weeks else '-'}</div>
     </div>
     <div class="summary-card">
       <div class="label">最新週 売上合計</div>
@@ -710,16 +746,17 @@ const chart_m3 = new Chart(document.getElementById('chart_m3'), {{
 function showWeeklyView(filtered) {{
   document.getElementById('weekly-view').style.display = 'block';
   document.getElementById('monthly-view').style.display = 'none';
-  chart1.data.labels = filtered;
+  const labels = filtered.map(w => weekly[w].label);
+  chart1.data.labels = labels;
   chart1.data.datasets[0].data = filtered.map(w => weekly[w].total);
   chart1.update();
-  chart2.data.labels = filtered;
+  chart2.data.labels = labels;
   srcKeys.forEach((src, i) => {{ chart2.data.datasets[i].data = filtered.map(w => weekly[w].by_source[src] || 0); }});
   chart2.update();
-  chart3.data.labels = filtered;
+  chart3.data.labels = labels;
   ALL_DATA.large_companies.forEach((c, i) => {{ chart3.data.datasets[i].data = filtered.map(w => weekly[w].by_company[c] || 0); }});
   chart3.update();
-  chart4.data.labels = filtered;
+  chart4.data.labels = labels;
   ALL_DATA.small_companies.forEach((c, i) => {{ chart4.data.datasets[i].data = filtered.map(w => weekly[w].by_company[c] || 0); }});
   chart4.update();
 }}
@@ -771,9 +808,17 @@ def main():
         "palette_large": PALETTE_LARGE,
         "palette_small": PALETTE_SMALL,
     }
+    print("■ JSライブラリ取得中（自己完結HTML用）...")
+    js_chartjs    = fetch_js(CDN_CHARTJS)
+    js_datalabels = fetch_js(CDN_DATALABELS)
+    if js_chartjs:
+        print("  ✅ インライン化成功 → 完全自己完結HTML")
+    else:
+        print("  ⚠️  インライン化失敗 → CDN参照HTML（要インターネット）")
+
     print("■ HTML生成中...")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = build_html(all_data, search_data, generated_at)
+    html = build_html(all_data, search_data, generated_at, js_chartjs, js_datalabels)
     OUTPUT_DIR.mkdir(exist_ok=True)
     OUTPUT_PATH.write_text(html, encoding="utf-8")
     print(f"✅ 出力完了: {OUTPUT_PATH}")
