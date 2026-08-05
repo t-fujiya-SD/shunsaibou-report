@@ -12,12 +12,16 @@
 """
 
 import sys
+import os
 import re
 import unicodedata
 import pandas as pd
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 # ─────────────────────────────────────────
 # 設定
@@ -173,6 +177,7 @@ def load_tanomu(week_dir: Path, master: dict) -> pd.DataFrame:
             "単価":     price,
             "数量":     qty,
             "金額":     (qty * price).round().astype(int),
+            "配送ID":   df["納品番号"].str.strip(),  # 納品番号=1配送
         })
     else:
         df = pd.read_csv(path, encoding="utf-8-sig", skiprows=1, header=0, dtype=str)
@@ -221,6 +226,15 @@ def load_daimyo(week_dir: Path, master: dict) -> pd.DataFrame:
 
     df = pd.read_excel(path, dtype=str)
     df = df[df["種"] == "1"].copy()
+    # 「月分」を含む行は月次まとめ請求のため除外
+    mask_tsuki = df["商品"].str.contains("月分", na=False)
+    if mask_tsuki.any():
+        excluded = df[mask_tsuki][["得意先", "商品", "金額"]].copy()
+        total = pd.to_numeric(excluded["金額"], errors="coerce").sum()
+        print(f"  ⚠️  月分除外: {mask_tsuki.sum()}行 / {int(total):,}円")
+        for _, r in excluded.iterrows():
+            print(f"      - {str(r['得意先']).strip()}: {str(r['商品']).strip()} {int(pd.to_numeric(r['金額'], errors='coerce')):,}円")
+        df = df[~mask_tsuki].copy()
     df["_日付"] = pd.to_datetime(
         df["伝票日付[年]"].str.zfill(4) + "-" +
         df["伝票日付[月]"].str.zfill(2) + "-" +
@@ -528,6 +542,10 @@ def main():
         write_sheet5(ws5, df_excl, week)
         wb.save(OUTPUT_PATH)
 
+    # Supabase upsert
+    upsert_weekly_sales(df_sum, week)
+    upsert_daily_sales(df_all, week)
+
     # 完了レポート
     total = df_all["金額"].sum()
     excl_total = df_excl["金額"].sum()
@@ -547,5 +565,103 @@ def main():
     print(f"{'='*60}\n")
 
 
+# ─────────────────────────────────────────
+# Supabase upsert
+# ─────────────────────────────────────────
+def upsert_daily_sales(df_all: pd.DataFrame, week: str) -> None:
+    """日次集計を Supabase の daily_sales テーブルへ upsert する。"""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        print("  [INFO] Supabase upsert をスキップ（daily_sales）")
+        return
+
+    try:
+        from supabase import create_client
+        client = create_client(url, key)
+
+        # 配送IDがあればそれを使用（タノムは納品番号）、NaNは合成キーで補完
+        df = df_all.copy()
+        if "配送ID" not in df.columns:
+            df["配送ID"] = None
+        # NaN（インフォマート等）は ソース_取引日_店舗名 を合成キーとして使用
+        mask = df["配送ID"].isna() | (df["配送ID"] == "")
+        df.loc[mask, "配送ID"] = (
+            df.loc[mask, "ソース"] + "_" +
+            df.loc[mask, "取引日"].astype(str) + "_" +
+            df.loc[mask, "店舗名"]
+        )
+
+        daily = df.groupby(["ソース", "取引日", "店舗名"]).agg(
+            amount=("金額", "sum"),
+            item_count=("金額", "count"),
+            delivery_count=("配送ID", "nunique"),
+        ).reset_index()
+
+        rows = [
+            {
+                "store_name":      row["店舗名"],
+                "date":            row["取引日"],
+                "week":            week,
+                "source":          row["ソース"],
+                "amount":          int(row["amount"]),
+                "item_count":      int(row["item_count"]),
+                "delivery_count":  int(row["delivery_count"]),
+                "tenant_id":       "shunsaibo",
+            }
+            for _, row in daily.iterrows()
+            if row["取引日"] and str(row["取引日"]) != "NaT" and str(row["取引日"]) != "nan"
+        ]
+
+        client.table("daily_sales").upsert(
+            rows, on_conflict="store_name,date,source"
+        ).execute()
+        print(f"  ✅ Supabase daily_sales upsert 完了: {len(rows)}件")
+
+    except Exception as e:
+        print(f"  ⚠️  Supabase daily_sales upsert 失敗（集計結果は正常）: {e}")
+
+
+def upsert_weekly_sales(df_sum: pd.DataFrame, week: str) -> None:
+    """週次サマリを Supabase の weekly_sales テーブルへ upsert する。
+    .env が未設定の場合はスキップ（エラーにしない）。
+    """
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        print("  [INFO] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 未設定 → Supabase upsert をスキップ")
+        return
+
+    try:
+        from supabase import create_client
+        client = create_client(url, key)
+
+        rows = [
+            {
+                "store_name": row["店舗名"],
+                "week":       week,
+                "source":     row["ソース"],
+                "amount":     int(row["合計金額（円）"]),
+                "item_count": int(row["取引件数"]),
+                "tenant_id":  "shunsaibo",
+            }
+            for _, row in df_sum.iterrows()
+        ]
+
+        # on_conflict で (store_name, week, source) の unique 制約を使って upsert
+        client.table("weekly_sales").upsert(
+            rows, on_conflict="store_name,week,source"
+        ).execute()
+
+        print(f"  ✅ Supabase upsert 完了: {len(rows)}件 → weekly_sales")
+
+    except Exception as e:
+        # 集計自体は成功しているので、通知だけしてエラーにしない
+        print(f"  ⚠️  Supabase upsert 失敗（集計結果は正常）: {e}")
+
+
+# ─────────────────────────────────────────
+# エントリポイント
+# ─────────────────────────────────────────
 if __name__ == "__main__":
     main()
