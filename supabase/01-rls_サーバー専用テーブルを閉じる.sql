@@ -17,7 +17,6 @@
 --   daily_sales / weekly_sales に書いているのは aggregate.py だけで、
 --   SUPABASE_SERVICE_ROLE_KEY を使っている（aggregate.py:565, 621）。service_role は RLS を
 --   バイパスするので upsert は通り続ける。読み手はローカルの HTML 生成のみで DB を読まない。
---   残り4テーブルは 0 行かつ参照コードなし。
 --
 -- ■ なぜ必要か（実測）
 --   公開 config.js から取れる anon キーで、daily_sales 10,386行 / weekly_sales 3,019行が
@@ -39,20 +38,16 @@ REVOKE ALL ON TABLE public.daily_sales  FROM anon, authenticated;
 ALTER TABLE public.weekly_sales ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.weekly_sales FROM anon, authenticated;
 
--- ── ② 旧・旬彩坊配送アプリのレガシー（いずれも 0 行・参照コードなし） ──
--- 中身が無いので今すぐの実害は無いが、書き込みが素通りする穴なので先に塞ぐ。
--- ★データは消さない。DROP もしない。万一まだ使っているアプリがあれば「動かなくなる」ことで気づける。
-ALTER TABLE public.manual_stops  ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON TABLE public.manual_stops  FROM anon, authenticated;
-
-ALTER TABLE public.delivery_logs ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON TABLE public.delivery_logs FROM anon, authenticated;
-
-ALTER TABLE public.order_imports ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON TABLE public.order_imports FROM anon, authenticated;
-
-ALTER TABLE public.incidents     ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON TABLE public.incidents     FROM anon, authenticated;
+-- ── ② レガシー（manual_stops / delivery_logs / order_imports / incidents）は対象外にした ──
+-- 当初は「0行だから塞いでおく」つもりだったが、Security Advisor の画面で確認したところ
+-- Critical(RLS Disabled) に挙がっているのは routes / weekly_sales / daily_sales /
+-- media_stores / pv_records の5つだけで、この4つは出ていない。
+-- 代わりに「Auth RLS Initialization Plan」（ポリシーがある表にだけ出る性能警告）側に載っている
+-- ＝ すでに RLS 有効かつポリシーあり。触る必要がない。
+--
+-- routes だけは兄弟テーブル（stores / drivers / contacts）と同じ扱いに揃えたいので、
+-- それらの既存ポリシーを 00-確認_RLSの現状.sql の③で見てから別ファイルで対応する。
+-- ここで安易に REVOKE すると、万一まだ動いている旧アプリで routes だけが落ちて挙動が不揃いになる。
 
 COMMIT;
 
@@ -63,19 +58,17 @@ NOTIFY pgrst, 'reload schema';
 -- ═══════════════════════════════════════════════════════════════════════════
 -- ■ 適用後の確認（SQL Editor で実行）
 -- ═══════════════════════════════════════════════════════════════════════════
---   ▼ 6テーブルとも rls有効=true・ポリシー数=0 になっていること
+--   ▼ 2テーブルとも rls有効=true・ポリシー数=0 になっていること
 --     SELECT c.relname, c.relrowsecurity,
 --            (SELECT count(*) FROM pg_policies p WHERE p.tablename = c.relname) AS policies
 --     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 --     WHERE n.nspname='public'
---       AND c.relname IN ('daily_sales','weekly_sales','manual_stops',
---                         'delivery_logs','order_imports','incidents');
+--       AND c.relname IN ('daily_sales','weekly_sales');
 --
 --   ▼ anon / authenticated の権限が1行も残っていないこと（期待: 0件）
 --     SELECT table_name, grantee, privilege_type FROM information_schema.role_table_grants
 --     WHERE table_schema='public' AND grantee IN ('anon','authenticated')
---       AND table_name IN ('daily_sales','weekly_sales','manual_stops',
---                          'delivery_logs','order_imports','incidents');
+--       AND table_name IN ('daily_sales','weekly_sales');
 --
 --   ▼ バッチが壊れていないこと（ターミナルで手動実行）
 --     cd ~/Documents/旬彩坊_週次集計 && .venv/bin/python aggregate.py
@@ -84,14 +77,9 @@ NOTIFY pgrst, 'reload schema';
 -- ■ ロールバック（元に戻す）
 -- ═══════════════════════════════════════════════════════════════════════════
 --   BEGIN;
---   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.daily_sales,  public.weekly_sales,
---         public.manual_stops, public.delivery_logs, public.order_imports, public.incidents
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.daily_sales, public.weekly_sales
 --     TO anon, authenticated;
 --   ALTER TABLE public.daily_sales   DISABLE ROW LEVEL SECURITY;
 --   ALTER TABLE public.weekly_sales  DISABLE ROW LEVEL SECURITY;
---   ALTER TABLE public.manual_stops  DISABLE ROW LEVEL SECURITY;
---   ALTER TABLE public.delivery_logs DISABLE ROW LEVEL SECURITY;
---   ALTER TABLE public.order_imports DISABLE ROW LEVEL SECURITY;
---   ALTER TABLE public.incidents     DISABLE ROW LEVEL SECURITY;
 --   COMMIT;
 --   NOTIFY pgrst, 'reload schema';
